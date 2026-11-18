@@ -1,0 +1,92 @@
+name: Post due Threads
+
+# 글 내용(원고·예약 목록)은 비공개 저장소 hanagomma/threads-content 에 있다.
+# 이 공개 저장소는 게시 프로그램만 갖고, 실행할 때 CONTENT_TOKEN 으로 비공개 저장소를 content/ 에 받아 쓴다.
+# 공개 로그에는 글 내용을 찍지 않는다 (글 번호·게시 결과만).
+#
+# 발행 누락 방지:
+# - 실행 하나가 최대 330분 깨어 있으면서 예약 시각마다 바로 올린다 (post_due.py KEEPER_MINUTES).
+# - 끝날 때 pending 글이 남아 있으면 마지막 단계에서 다음 실행을 스스로 건다.
+# - 사슬이 끊겨도 GitHub 예약 실행(하루 몇 번)이나 수동 실행으로 다시 이어진다.
+# - 밀린 글은 건너뛰지 않고 다음 게시 칸으로 민다.
+on:
+  schedule:
+    - cron: "*/10 22,23,0,10,11,12,13,14 * * *"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "1이면 실제로 올리지 않고 확인만"
+        default: "0"
+      max_posts:
+        description: "한 번에 최대 몇 개까지 올릴지"
+        default: "2"
+      wait_minutes:
+        description: "(예전 입력, 지금은 무시됨)"
+        default: "0"
+
+permissions:
+  contents: read
+  actions: write   # 다음 실행을 스스로 걸기 위해 필요
+
+concurrency:
+  group: threads-post
+  cancel-in-progress: false
+
+jobs:
+  post:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    env:
+      CONTENT_DIR: ${{ github.workspace }}/content
+    steps:
+      - run: echo "START_TS=$(date +%s)" >> "$GITHUB_ENV"
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: hanagomma/threads-content
+          token: ${{ secrets.CONTENT_TOKEN }}
+          path: content
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install requests
+      - working-directory: content
+        run: |
+          git config user.name "threads-bot"
+          git config user.email "threads-bot@users.noreply.github.com"
+      - name: Check token (dry run only)
+        if: github.event.inputs.dry_run == '1'
+        env:
+          THREADS_ACCESS_TOKEN: ${{ secrets.THREADS_ACCESS_TOKEN }}
+        run: python scripts/check_token.py > /dev/null && echo "토큰 정상"
+      - name: Post due items
+        env:
+          PUSH_EACH: "1"
+          THREADS_ACCESS_TOKEN: ${{ secrets.THREADS_ACCESS_TOKEN }}
+          DRY_RUN: ${{ github.event.inputs.dry_run || '0' }}
+          MAX_PER_RUN: ${{ github.event.inputs.max_posts || '2' }}
+          KEEPER_MINUTES: "330"
+        run: python scripts/post_due.py
+      - name: Save status
+        if: always()
+        working-directory: content
+        run: |
+          if ! git diff --quiet posts.json; then
+            git commit -q -am "posted: $(date -u +%FT%TZ)"
+            git pull -q --rebase origin main
+            git push -q
+          fi
+      - name: Chain next run
+        # 남은 pending 글이 있으면 다음 실행을 건다. 스크립트가 비정상 종료했으면 15분 쉬었다가 건다(무한 반복 방지).
+        if: always() && github.event.inputs.dry_run != '1'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          (cd content && git pull -q --rebase origin main) || true
+          left=$(python -c "import json;print(sum(p['status']=='pending' for p in json.load(open('content/posts.json'))['posts']))")
+          echo "남은 pending: $left"
+          if [ "$left" = "0" ]; then exit 0; fi
+          if [ ! -f .keeper_ok ]; then echo "스크립트 비정상 종료 → 15분 뒤 다음 실행"; sleep 900; fi
+          # 안전장치: 이번 실행이 10분도 안 돼 끝났으면(무한 반복 방지) 10분 쉬었다가 건다
+          if [ $(( $(date +%s) - START_TS )) -lt 600 ]; then echo "실행이 너무 짧음 → 10분 뒤 다음 실행"; sleep 600; fi
+          gh workflow run post.yml --repo "$GITHUB_REPOSITORY" --ref main
