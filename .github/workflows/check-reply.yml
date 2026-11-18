@@ -1,0 +1,22 @@
+name: Reply permission check
+
+on:
+  workflow_dispatch:
+    inputs:
+      reply_to:
+        description: "답글을 달아 볼 내 글의 media id (실제로 게시하지는 않음)"
+        required: true
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install requests
+      - env:
+          THREADS_ACCESS_TOKEN: ${{ secrets.THREADS_ACCESS_TOKEN }}
+          REPLY_TO: ${{ github.event.inputs.reply_to }}
+        run: python scripts/check_reply.py

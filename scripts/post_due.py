@@ -37,9 +37,12 @@ KST = timezone(timedelta(hours=9))
 POST_HOURS_KST = {7, 8, 9, 19, 20, 21, 22, 23}  # 이 시간대(KST)에만 게시. GitHub 실행이 밀려 새벽에 도는 경우 방지
 
 
-def publish(token: str, text: str) -> str:
-    r = requests.post(f"{API}/me/threads",
-                      data={"media_type": "TEXT", "text": text, "access_token": token}, timeout=30)
+def publish(token: str, text: str, reply_to: str | None = None) -> str:
+    """글 하나를 올리고 media id 를 돌려준다. reply_to 가 있으면 그 글의 답글로 올린다."""
+    data = {"media_type": "TEXT", "text": text, "access_token": token}
+    if reply_to:
+        data["reply_to_id"] = reply_to
+    r = requests.post(f"{API}/me/threads", data=data, timeout=30)
     if not r.ok:  # Meta 오류 메시지를 남겨야 원인을 알 수 있다 (토큰 값은 응답에 없음)
         raise RuntimeError(f"{r.status_code} {r.text[:250]}")
     creation_id = r.json()["id"]
@@ -127,11 +130,27 @@ def post_batch(data, token, dry):
             posted += 1
             continue
         try:
-            media_id = publish(token, p["text"])
+            # 연재 글: 첫 글(text) + 답글(replies)을 같은 칸에 이어서 올린다. 답글은 바로 앞 글에 단다.
+            # 중간에 실패하면 올라간 것까지 기록해 두고(media_id, reply_ids), 다음 시도에서 남은 답글부터 잇는다.
+            replies = p.get("replies") or []
+            media_id = p.get("media_id")
+            if not media_id:
+                media_id = publish(token, p["text"])
+                print(f"[ok] #{p['id']} -> {media_id}", flush=True)
+                done = not replies
+                record(p["id"], f"posted #{p['id']}", drop=("last_error",) if done else (),
+                       status="posted" if done else "pending", media_id=media_id,
+                       posted_at=datetime.now(timezone.utc).isoformat(timespec="seconds"))
+            reply_ids = list(p.get("reply_ids") or [])
+            for i in range(len(reply_ids), len(replies)):
+                time.sleep(5)
+                rid = publish(token, replies[i], reply_to=reply_ids[-1] if reply_ids else media_id)
+                reply_ids.append(rid)
+                print(f"[ok] #{p['id']} 답글 {i + 1}/{len(replies)} -> {rid}", flush=True)
+                record(p["id"], f"reply #{p['id']} {i + 1}/{len(replies)}", reply_ids=reply_ids)
+            if replies:
+                record(p["id"], f"posted #{p['id']} (답글 {len(replies)}개)", drop=("last_error",), status="posted")
             p["status"] = "posted"
-            print(f"[ok] #{p['id']} -> {media_id}", flush=True)
-            record(p["id"], f"posted #{p['id']}", drop=("last_error",), status="posted", media_id=media_id,
-                   posted_at=datetime.now(timezone.utc).isoformat(timespec="seconds"))
         except Exception as e:  # 실패는 기록만 하고 다음 실행 때 다시 시도
             print(f"[fail] #{p['id']} {e}", flush=True)
             record(p["id"], f"failed #{p['id']}", last_error=str(e)[:300])
@@ -157,7 +176,8 @@ def next_slot(t: datetime) -> datetime:
 def plan_reslot(posts, now: datetime):
     """RESLOT_AFTER_MIN 분 넘게 밀린 pending 글이 있으면, pending 글 전체를 순서대로 다음 칸부터 다시 배정한다.
     원래 시각이 더 늦은 글은 그 시각을 지킨다(일부러 비워 둔 날짜 유지). 반환: {id: 새 scheduled_at}"""
-    pend = sorted((p for p in posts if p["status"] == "pending"), key=lambda p: (p["scheduled_at"], p["id"]))
+    pend = sorted((p for p in posts if p["status"] == "pending" and not p.get("media_id")),  # 답글 이어 올리는 중인 글은 제외
+                  key=lambda p: (p["scheduled_at"], p["id"]))
     if not pend or now - datetime.fromisoformat(pend[0]["scheduled_at"]) <= timedelta(minutes=RESLOT_AFTER_MIN):
         return {}
     moves, cursor = {}, next_slot(now)
